@@ -1,0 +1,18 @@
+[package]
+name = "llm-contract"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+solana-program = "1.15.2"
+byteorder = "1.4.3"
+bytemuck = "1.13.1"
+
+[dev-dependencies]
+solana-sdk = "1.15.2"
+
+[lib]
+name = "llm"
+crate-type = ["cdylib", "lib"]
