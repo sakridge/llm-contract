@@ -9,7 +9,10 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::{Pubkey, PUBKEY_BYTES},
 };
-use std::{io::Cursor, mem::size_of};
+use std::{
+    io::{Cursor, Read, Write},
+    mem::size_of,
+};
 
 #[cfg(feature = "serde-traits")]
 use {
@@ -43,7 +46,42 @@ struct LlamaJobParameters {
     output_len: u32,
 }
 
-impl MLJobPoolState {}
+impl MLJobPoolState {
+    pub fn unpack(data: &[u8]) -> Result<Self, MLPoolError> {
+        let mut reader = Cursor::new(data);
+        let initialized = reader
+            .read_u8()
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        if initialized != 1 {
+            return Err(MLPoolError::InvalidPoolState);
+        }
+        let jobs_len = reader
+            .read_u64::<LittleEndian>()
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        for i in 0..jobs_len { /* read job */ }
+        let validator_whitelist_len = reader
+            .read_u64::<LittleEndian>()
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        if reader.get_ref().len()
+            < validator_whitelist_len as usize * size_of::<Pubkey>() + reader.position() as usize
+        {
+            return Err(MLPoolError::InvalidInstruction);
+        }
+        let mut validator_whitelist = Vec::with_capacity(validator_whitelist_len as usize);
+        for i in 0..validator_whitelist_len {
+            let mut bytes = [0u8; 32];
+            let bytes_read = reader
+                .read_exact(&mut bytes)
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+            let key = Pubkey::from(bytes);
+            validator_whitelist.push(key);
+        }
+        Ok(MLJobPoolState {
+            jobs: vec![],
+            validator_whitelist,
+        })
+    }
+}
 
 #[repr(C)]
 #[cfg_attr(feature = "serde-traits", derive(Serialize, Deserialize))]
@@ -72,6 +110,7 @@ enum MLPoolInstruction {
 enum MLPoolError {
     InvalidInstruction,
     InvalidPoolCreator,
+    InvalidPoolState,
     InvalidValidator,
 }
 
@@ -81,6 +120,7 @@ impl From<MLPoolError> for ProgramError {
             MLPoolError::InvalidInstruction => ProgramError::Custom(0),
             MLPoolError::InvalidPoolCreator => ProgramError::Custom(1),
             MLPoolError::InvalidValidator => ProgramError::Custom(2),
+            MLPoolError::InvalidPoolState => ProgramError::Custom(3),
         }
     }
 }
@@ -171,7 +211,30 @@ pub fn process_instruction(
 ) -> ProgramResult {
     // log a message to the blockchain
     match MLPoolInstruction::unpack(instruction_data)? {
-        MLPoolInstruction::InitializePool { key } => {}
+        MLPoolInstruction::InitializePool { key } => {
+            let account_info_iter = &mut accounts.iter();
+            let new_pool = next_account_info(account_info_iter)?;
+            let mut new_pool_data = new_pool.data.borrow_mut();
+            let (initialized, new_pool_data) = new_pool_data
+                .split_first_mut()
+                .ok_or(MLPoolError::InvalidInstruction)?;
+            if *initialized != 0 {
+                msg!("already initialized, aborting");
+                Err(MLPoolError::InvalidInstruction)?;
+            }
+            msg!("initializing new");
+            *initialized = 1;
+            let mut cursor = Cursor::new(new_pool_data);
+            cursor
+                .write_u64::<LittleEndian>(0)
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+            cursor
+                .write_u64::<LittleEndian>(1)
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+            cursor
+                .write(&key.to_bytes())
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        }
         MLPoolInstruction::AddPoolMember { key: _ } => {}
         MLPoolInstruction::RemovePoolMember { key: _ } => {}
         MLPoolInstruction::PostJob { parameters } => {
@@ -193,66 +256,28 @@ mod tests {
     use super::*;
     use solana_sdk::account::{Account, ReadableAccount};
 
-    fn initialize_vault(creator: Pubkey) -> Account {
-        let mut vault_creator_account =
-            Account::new(42, LendingState::get_packed_len(), &crate::id());
-        let vault_creator_account_info: AccountInfo =
-            (&creator, true, &mut vault_creator_account).into();
-        let id =
-            MLPoolInstruction::pack(&MLPoolInstruction::InitializeVaultCreator { key: creator });
-        let accounts = vec![vault_creator_account_info];
-        process_instruction(&crate::id(), &accounts, &id).unwrap();
-        vault_creator_account
+    fn job_pool_size() -> usize {
+        /* jobs */
+        size_of::<usize>() + 10 * 50
+            /* whitelist */
+            + size_of::<usize>() + 10 * size_of::<Pubkey>()
     }
 
     #[test]
-    fn test_initialize_vault_creator() {
+    fn test_initialize_pool() {
         let creator = Pubkey::new_unique();
-        let account = initialize_vault(creator);
-        let lending_state = LendingState::unpack(&account.data()).unwrap();
-        assert_eq!(lending_state.vault_creators.len(), 1);
-        assert_eq!(lending_state.vault_creators[0], creator);
+        let instruction = MLPoolInstruction::InitializePool { key: creator };
+        let packed = instruction.pack();
+
+        let mut pool_account = Account::new(42, job_pool_size(), &crate::id());
+        let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
+
+        let accounts = vec![pool_account_info];
+
+        process_instruction(&id(), &accounts, &packed).unwrap();
+
+        let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
+        assert_eq!(pool_state.jobs.len(), 0);
+        assert_eq!(pool_state.validator_whitelist.len(), 1);
     }
-
-    #[test]
-    fn test_create_vault() {
-        let vaults_manager = Pubkey::new_unique();
-        let vault_owner = Pubkey::new_unique();
-        let new_vault = Pubkey::new_unique();
-        let mut vaults_manager_account = initialize_vault(vault_owner);
-
-        let instruction = LendingInstruction::pack(&LendingInstruction::CreateVault {});
-
-        //todo: should the owner be the crate::id? does it matter?
-        let mut vault_creator_account = Account::new(42, 0, &crate::id());
-
-        let mut new_vault_account = Account::new(42, VaultState::get_packed_len(), &crate::id());
-
-        let vault_creator_account_info: AccountInfo =
-            (&vault_owner, true, &mut vault_creator_account).into();
-
-        let vaults_manager_account_info: AccountInfo =
-            (&vaults_manager, true, &mut vaults_manager_account).into();
-
-        let new_vault_account_info: AccountInfo = (&new_vault, true, &mut new_vault_account).into();
-
-        let accounts = vec![
-            vaults_manager_account_info,
-            vault_creator_account_info,
-            new_vault_account_info,
-        ];
-        process_instruction(&crate::id(), &accounts, &instruction).unwrap();
-    }
-
-    #[test]
-    fn test_lender_deposit() {
-        let instruction = LendingInstruction::pack(&LendingInstruction::LenderDeposit {});
-        let accounts = vec![];
-        process_instruction(&crate::id(), &accounts, &instruction).unwrap();
-        assert!(accounts[0].data.borrow().is_empty());
-    }
-
-    // A test to
-    #[test]
-    fn test_something() {}
 }
