@@ -47,14 +47,35 @@ struct LlamaJobParameters {
 }
 
 impl MLJobPoolState {
+    pub fn pack(&self, data: &mut [u8]) -> Result<(), MLPoolError> {
+        let mut cursor = Cursor::new(data);
+        cursor
+            .write_u8(1)
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        cursor
+            .write_u64::<LittleEndian>(self.jobs.len() as u64)
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        cursor
+            .write_u64::<LittleEndian>(self.validator_whitelist.len() as u64)
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        for key in self.validator_whitelist.iter() {
+            cursor
+                .write(&key.to_bytes())
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        }
+        Ok(())
+    }
+
     pub fn unpack(data: &[u8]) -> Result<Self, MLPoolError> {
         let mut reader = Cursor::new(data);
         let initialized = reader
             .read_u8()
             .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        msg!("init'ed?");
         if initialized != 1 {
             return Err(MLPoolError::InvalidPoolState);
         }
+        msg!("init'ed");
         let jobs_len = reader
             .read_u64::<LittleEndian>()
             .map_err(|_e| MLPoolError::InvalidInstruction)?;
@@ -65,10 +86,12 @@ impl MLJobPoolState {
         if reader.get_ref().len()
             < validator_whitelist_len as usize * size_of::<Pubkey>() + reader.position() as usize
         {
+            msg!("bad len");
             return Err(MLPoolError::InvalidInstruction);
         }
         let mut validator_whitelist = Vec::with_capacity(validator_whitelist_len as usize);
         for i in 0..validator_whitelist_len {
+            msg!("reading key {}", i);
             let mut bytes = [0u8; 32];
             let bytes_read = reader
                 .read_exact(&mut bytes)
@@ -76,6 +99,7 @@ impl MLJobPoolState {
             let key = Pubkey::from(bytes);
             validator_whitelist.push(key);
         }
+        msg!("done!");
         Ok(MLJobPoolState {
             jobs: vec![],
             validator_whitelist,
@@ -112,6 +136,7 @@ enum MLPoolError {
     InvalidPoolCreator,
     InvalidPoolState,
     InvalidValidator,
+    InvalidStateSize,
 }
 
 impl From<MLPoolError> for ProgramError {
@@ -121,6 +146,7 @@ impl From<MLPoolError> for ProgramError {
             MLPoolError::InvalidPoolCreator => ProgramError::Custom(1),
             MLPoolError::InvalidValidator => ProgramError::Custom(2),
             MLPoolError::InvalidPoolState => ProgramError::Custom(3),
+            MLPoolError::InvalidStateSize => ProgramError::Custom(4),
         }
     }
 }
@@ -141,7 +167,7 @@ impl MLPoolInstruction {
 
     pub fn pack(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(size_of::<Self>());
-        msg!("buf.len(): {}", buf.len());
+        msg!("packing buf.len(): {}", buf.len());
         match self {
             &Self::InitializePool { key } => {
                 buf.push(0);
@@ -215,27 +241,31 @@ pub fn process_instruction(
             let account_info_iter = &mut accounts.iter();
             let new_pool = next_account_info(account_info_iter)?;
             let mut new_pool_data = new_pool.data.borrow_mut();
-            let (initialized, new_pool_data) = new_pool_data
-                .split_first_mut()
-                .ok_or(MLPoolError::InvalidInstruction)?;
-            if *initialized != 0 {
+            if new_pool_data.len() <= 2 {
+                Err(MLPoolError::InvalidInstruction)?;
+            }
+            if new_pool_data[0] != 0 {
                 msg!("already initialized, aborting");
                 Err(MLPoolError::InvalidInstruction)?;
             }
             msg!("initializing new");
-            *initialized = 1;
-            let mut cursor = Cursor::new(new_pool_data);
-            cursor
-                .write_u64::<LittleEndian>(0)
-                .map_err(|_e| MLPoolError::InvalidInstruction)?;
-            cursor
-                .write_u64::<LittleEndian>(1)
-                .map_err(|_e| MLPoolError::InvalidInstruction)?;
-            cursor
-                .write(&key.to_bytes())
-                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+            let state = MLJobPoolState {
+                jobs: vec![],
+                validator_whitelist: vec![key],
+            };
+            state.pack(&mut new_pool_data)?;
         }
-        MLPoolInstruction::AddPoolMember { key: _ } => {}
+        MLPoolInstruction::AddPoolMember { key } => {
+            let account_info_iter = &mut accounts.iter();
+            let new_pool = next_account_info(account_info_iter)?;
+            let mut new_pool_data = new_pool.data.borrow_mut();
+            msg!("unpacking..");
+            let mut state = MLJobPoolState::unpack(&mut new_pool_data)?;
+            msg!("done unpacking..");
+            state.validator_whitelist.push(key);
+            msg!("packing..");
+            state.pack(&mut new_pool_data)?;
+        }
         MLPoolInstruction::RemovePoolMember { key: _ } => {}
         MLPoolInstruction::PostJob { parameters } => {
             let account_info_iter = &mut accounts.iter();
@@ -263,8 +293,7 @@ mod tests {
             + size_of::<usize>() + 10 * size_of::<Pubkey>()
     }
 
-    #[test]
-    fn test_initialize_pool() {
+    fn initialize_pool() -> (Pubkey, Account) {
         let creator = Pubkey::new_unique();
         let instruction = MLPoolInstruction::InitializePool { key: creator };
         let packed = instruction.pack();
@@ -276,8 +305,38 @@ mod tests {
 
         process_instruction(&id(), &accounts, &packed).unwrap();
 
+        (creator, pool_account)
+    }
+
+    #[test]
+    fn test_initialize_pool() {
+        let (_creator, pool_account) = initialize_pool();
+
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
         assert_eq!(pool_state.validator_whitelist.len(), 1);
+    }
+
+    #[test]
+    fn test_add_validator() {
+        let (creator, mut pool_account) = initialize_pool();
+
+        let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
+        assert_eq!(pool_state.jobs.len(), 0);
+        assert_eq!(pool_state.validator_whitelist.len(), 1);
+
+        let new_validator = Pubkey::new_unique();
+        let instruction = MLPoolInstruction::AddPoolMember { key: new_validator };
+        let packed = instruction.pack();
+
+        let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
+
+        let accounts = vec![pool_account_info];
+        process_instruction(&id(), &accounts, &packed).unwrap();
+        let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
+        assert_eq!(pool_state.jobs.len(), 0);
+        assert_eq!(pool_state.validator_whitelist.len(), 2);
+        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist[1], new_validator);
     }
 }
