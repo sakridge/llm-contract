@@ -26,6 +26,7 @@ solana_program::declare_id!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 #[derive(Default)]
 struct MLJobPoolState {
+    creator: Pubkey,
     jobs: Vec<MLJob>,
     validator_whitelist: Vec<Pubkey>,
 }
@@ -52,6 +53,9 @@ impl MLJobPoolState {
         let mut cursor = Cursor::new(data);
         cursor
             .write_u8(1)
+            .map_err(|_e| MLPoolError::InvalidInstruction)?;
+        cursor
+            .write(&self.creator.to_bytes())
             .map_err(|_e| MLPoolError::InvalidInstruction)?;
         msg!("writing jobs len: {}", self.jobs.len());
         cursor
@@ -98,6 +102,14 @@ impl MLJobPoolState {
             return Err(MLPoolError::InvalidPoolState);
         }
         msg!("init'ed");
+        let creator = {
+            let mut bytes = [0u8; 32];
+            reader
+                .read_exact(&mut bytes)
+                .map_err(|_e| MLPoolError::InvalidInstruction)?;
+            Pubkey::from(bytes)
+        };
+
         let jobs_len = reader
             .read_u64::<LittleEndian>()
             .map_err(|_e| MLPoolError::InvalidInstruction)?;
@@ -117,10 +129,10 @@ impl MLJobPoolState {
                 .map_err(|_e| MLPoolError::InvalidInstruction)?;
 
             let mut attestations = Vec::with_capacity(attestations_len as usize);
-            for j in 0..attestations_len {
+            for _j in 0..attestations_len {
                 let mut bytes = [0u8; 32];
 
-                let bytes_read = reader
+                let _bytes_read = reader
                     .read_exact(&mut bytes)
                     .map_err(|_e| MLPoolError::InvalidInstruction)?;
                 let key = Pubkey::from(bytes);
@@ -151,7 +163,7 @@ impl MLJobPoolState {
         for i in 0..validator_whitelist_len {
             msg!("reading key {}", i);
             let mut bytes = [0u8; 32];
-            let bytes_read = reader
+            let _bytes_read = reader
                 .read_exact(&mut bytes)
                 .map_err(|_e| MLPoolError::InvalidInstruction)?;
             let key = Pubkey::from(bytes);
@@ -159,6 +171,7 @@ impl MLJobPoolState {
         }
         msg!("done!");
         Ok(MLJobPoolState {
+            creator,
             jobs,
             validator_whitelist,
         })
@@ -262,7 +275,7 @@ impl MLPoolInstruction {
                 buf.extend_from_slice(&parameters);
             }
             _ => {
-                todo!()
+                unreachable!()
             }
         }
         buf
@@ -308,7 +321,7 @@ impl MLPoolInstruction {
 }
 
 impl From<PodCastError> for MLPoolError {
-    fn from(e: PodCastError) -> Self {
+    fn from(_e: PodCastError) -> Self {
         MLPoolError::InvalidInstruction
     }
 }
@@ -337,8 +350,9 @@ pub fn process_instruction(
             }
             msg!("initializing new");
             let state = MLJobPoolState {
+                creator: key,
                 jobs: vec![],
-                validator_whitelist: vec![key],
+                validator_whitelist: vec![],
             };
             state.pack(&mut new_pool_data)?;
         }
@@ -443,7 +457,6 @@ pub fn process_instruction(
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use rand::{thread_rng, Rng};
     use solana_sdk::account::{Account, ReadableAccount};
 
     fn job_pool_size() -> usize {
@@ -470,11 +483,12 @@ mod tests {
 
     #[test]
     fn test_initialize_pool() {
-        let (_creator, pool_account) = initialize_pool();
+        let (creator, pool_account) = initialize_pool();
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
+        assert_eq!(pool_state.creator, creator);
     }
 
     #[test]
@@ -483,7 +497,8 @@ mod tests {
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
+        assert_eq!(pool_state.creator, creator);
 
         let new_validator = Pubkey::new_unique();
         let instruction = MLPoolInstruction::AddPoolMember { key: new_validator };
@@ -496,9 +511,8 @@ mod tests {
         {
             let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
             assert_eq!(pool_state.jobs.len(), 0);
-            assert_eq!(pool_state.validator_whitelist.len(), 2);
-            assert_eq!(pool_state.validator_whitelist[0], creator);
-            assert_eq!(pool_state.validator_whitelist[1], new_validator);
+            assert_eq!(pool_state.validator_whitelist.len(), 1);
+            assert_eq!(pool_state.validator_whitelist[0], new_validator);
         }
 
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
@@ -550,16 +564,16 @@ mod tests {
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
+        assert_eq!(pool_state.creator, creator);
 
         let new_validator = Pubkey::new_unique();
         add_whitelist_validator(new_validator, &creator, &mut pool_account).unwrap();
         {
             let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
             assert_eq!(pool_state.jobs.len(), 0);
-            assert_eq!(pool_state.validator_whitelist.len(), 2);
-            assert_eq!(pool_state.validator_whitelist[0], creator);
-            assert_eq!(pool_state.validator_whitelist[1], new_validator);
+            assert_eq!(pool_state.validator_whitelist.len(), 1);
+            assert_eq!(pool_state.validator_whitelist[0], new_validator);
         }
 
         // Add another, should fail from already being there
@@ -573,8 +587,7 @@ mod tests {
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
-        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
 
         // Remove again, should not find it
         assert_matches!(
@@ -584,8 +597,7 @@ mod tests {
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
-        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
     }
 
     #[test]
@@ -594,10 +606,10 @@ mod tests {
 
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
+        assert_eq!(pool_state.creator, creator);
 
-        let new_validator = Pubkey::new_unique();
-        let mut parameters: [u8; 10] = rand::random();
+        let parameters: [u8; 10] = rand::random();
         let instruction = MLPoolInstruction::PostJob {
             parameters: parameters.to_vec(),
         };
@@ -613,8 +625,7 @@ mod tests {
             assert_eq!(pool_state.jobs.len(), 1);
             assert_eq!(pool_state.jobs[0].parameters, parameters);
             assert_eq!(pool_state.jobs[0].attestations.len(), 0);
-            assert_eq!(pool_state.validator_whitelist.len(), 1);
-            assert_eq!(pool_state.validator_whitelist[0], creator);
+            assert_eq!(pool_state.validator_whitelist.len(), 0);
         }
 
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
@@ -626,8 +637,7 @@ mod tests {
         assert_eq!(pool_state.jobs.len(), 2);
         assert_eq!(pool_state.jobs[0].parameters, parameters);
         assert_eq!(pool_state.jobs[1].parameters, parameters);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
-        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
 
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
         let accounts = vec![pool_account_info];
@@ -646,8 +656,7 @@ mod tests {
         assert_eq!(pool_state.jobs[0].parameters, parameters);
         assert_eq!(pool_state.jobs[1].parameters, parameters);
         assert_eq!(pool_state.jobs[2].parameters, parameters2);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
-        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
     }
 
     #[test]
@@ -657,8 +666,7 @@ mod tests {
         msg!("creator: {}", creator);
         let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
         assert_eq!(pool_state.jobs.len(), 0);
-        assert_eq!(pool_state.validator_whitelist.len(), 1);
-        assert_eq!(pool_state.validator_whitelist[0], creator);
+        assert_eq!(pool_state.validator_whitelist.len(), 0);
 
         let instruction = MLPoolInstruction::ValidateJob {
             job_index: 0,
@@ -678,8 +686,7 @@ mod tests {
         );
 
         // add a job
-        let new_validator = Pubkey::new_unique();
-        let mut parameters: [u8; 10] = rand::random();
+        let parameters: [u8; 10] = rand::random();
         let instruction = MLPoolInstruction::PostJob {
             parameters: parameters.to_vec(),
         };
@@ -695,9 +702,13 @@ mod tests {
         };
         let packed = instruction.pack();
 
+        let new_validator = Pubkey::new_unique();
+        add_whitelist_validator(new_validator, &creator, &mut pool_account).unwrap();
+
         // validate it
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
-        let validator_account_info: AccountInfo = (&creator, true, &mut validator_account).into();
+        let validator_account_info: AccountInfo =
+            (&new_validator, true, &mut validator_account).into();
         let accounts = vec![pool_account_info, validator_account_info];
         process_instruction(&id(), &accounts, &packed).unwrap();
         {
@@ -705,10 +716,10 @@ mod tests {
             assert_eq!(pool_state.jobs.len(), 1);
             assert_eq!(pool_state.jobs[0].parameters, parameters);
             assert_eq!(pool_state.jobs[0].attestations.len(), 1);
-            assert_eq!(pool_state.jobs[0].attestations[0].0, creator);
+            assert_eq!(pool_state.jobs[0].attestations[0].0, new_validator);
             assert_eq!(pool_state.jobs[0].attestations[0].1, Hash::default());
             assert_eq!(pool_state.validator_whitelist.len(), 1);
-            assert_eq!(pool_state.validator_whitelist[0], creator);
+            assert_eq!(pool_state.validator_whitelist[0], new_validator);
         }
     }
 }
