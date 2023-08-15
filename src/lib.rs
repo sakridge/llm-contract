@@ -1,4 +1,4 @@
-use bytemuck::{Pod, PodCastError, Zeroable};
+use bytemuck::PodCastError;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -132,7 +132,7 @@ impl MLJobPoolState {
             for _j in 0..attestations_len {
                 let mut bytes = [0u8; 32];
 
-                let _bytes_read = reader
+                reader
                     .read_exact(&mut bytes)
                     .map_err(|_e| MLPoolError::InvalidInstruction)?;
                 let key = Pubkey::from(bytes);
@@ -163,7 +163,7 @@ impl MLJobPoolState {
         for i in 0..validator_whitelist_len {
             msg!("reading key {}", i);
             let mut bytes = [0u8; 32];
-            let _bytes_read = reader
+            reader
                 .read_exact(&mut bytes)
                 .map_err(|_e| MLPoolError::InvalidInstruction)?;
             let key = Pubkey::from(bytes);
@@ -183,20 +183,12 @@ impl MLJobPoolState {
 enum MLPoolInstruction {
     /* Initialize an ml pool with a whitelist starting with the key
      * accounts:
-     *   0 - new vaults manager account
+     *   0 - new pool account
      */
     InitializePool { key: Pubkey },
     AddPoolMember { key: Pubkey },
     RemovePoolMember { key: Pubkey },
 
-    /* ValidateJob
-     * accounts:
-     *    0 - Vaults manager account - signed: no, ro: yes
-     *        Manager account, checks that the creator is in the whitelist
-     *    1 - Vault creator - signed: yes: ro: yes
-     *    2 - Vault account - signed: yes: ro: no
-     *        Account to write the new vault into
-     */
     PostJob { parameters: Vec<u8> },
     ValidateJob { job_index: u16, hash: Hash },
 }
@@ -210,27 +202,11 @@ enum MLPoolError {
     InvalidStateSize = 4,
     AlreadyExists = 5,
     BadJobIndex = 6,
-    ValidatorNotOnWhitelist = 7,
 }
 
 impl From<MLPoolError> for ProgramError {
     fn from(error: MLPoolError) -> Self {
-        match error {
-            MLPoolError::InvalidInstruction => {
-                ProgramError::Custom(MLPoolError::InvalidInstruction as u32)
-            }
-            MLPoolError::InvalidPoolCreator => {
-                ProgramError::Custom(MLPoolError::InvalidPoolCreator as u32)
-            }
-            MLPoolError::InvalidValidator => {
-                ProgramError::Custom(MLPoolError::InvalidValidator as u32)
-            }
-            MLPoolError::InvalidPoolState => ProgramError::Custom(3),
-            MLPoolError::InvalidStateSize => ProgramError::Custom(4),
-            MLPoolError::AlreadyExists => ProgramError::Custom(5),
-            MLPoolError::BadJobIndex => ProgramError::Custom(6),
-            MLPoolError::ValidatorNotOnWhitelist => ProgramError::Custom(6),
-        }
+        ProgramError::Custom(error as u32)
     }
 }
 
@@ -240,7 +216,7 @@ impl MLPoolInstruction {
         let pk = input
             .get(..PUBKEY_BYTES)
             .map(Pubkey::new)
-            .ok_or(MLPoolError::InvalidInstruction)?;
+            .ok_or(MLPoolError::InvalidStateSize)?;
         Ok((pk, &input[PUBKEY_BYTES..]))
     }
 
@@ -272,10 +248,7 @@ impl MLPoolInstruction {
             }
             Self::PostJob { parameters } => {
                 buf.push(3);
-                buf.extend_from_slice(&parameters);
-            }
-            _ => {
-                unreachable!()
+                buf.extend_from_slice(parameters);
             }
         }
         buf
@@ -366,7 +339,7 @@ pub fn process_instruction(
             }
             let mut new_pool_data = pool.data.borrow_mut();
             msg!("unpacking..");
-            let mut state = MLJobPoolState::unpack(&mut new_pool_data)?;
+            let mut state = MLJobPoolState::unpack(&new_pool_data)?;
             if *creator.key != state.creator {
                 Err(MLPoolError::InvalidPoolCreator)?;
             }
@@ -389,7 +362,7 @@ pub fn process_instruction(
             }
             let mut pool_data = pool.data.borrow_mut();
             msg!("unpacking..");
-            let mut state = MLJobPoolState::unpack(&mut pool_data)?;
+            let mut state = MLJobPoolState::unpack(&pool_data)?;
             if *creator.key != state.creator {
                 Err(MLPoolError::InvalidPoolCreator)?;
             }
@@ -414,7 +387,7 @@ pub fn process_instruction(
             let pool = next_account_info(account_info_iter)?;
             let mut pool_data = pool.data.borrow_mut();
             msg!("post job: {}", parameters.len());
-            let mut state = MLJobPoolState::unpack(&mut pool_data)?;
+            let mut state = MLJobPoolState::unpack(&pool_data)?;
             state.jobs.push(MLJob {
                 parameters,
                 attestations: vec![],
@@ -431,7 +404,7 @@ pub fn process_instruction(
                 Err(MLPoolError::InvalidInstruction)?;
             }
             let mut pool_data = pool.data.borrow_mut();
-            let mut state = MLJobPoolState::unpack(&mut pool_data)?;
+            let mut state = MLJobPoolState::unpack(&pool_data)?;
             let mut found = false;
             for wl_validator in &state.validator_whitelist {
                 msg!("{} .. {}", wl_validator, validator.key);
@@ -442,7 +415,7 @@ pub fn process_instruction(
             }
             if !found {
                 msg!("whitelist error");
-                Err(MLPoolError::ValidatorNotOnWhitelist)?;
+                Err(MLPoolError::InvalidValidator)?;
             }
             let job_index = job_index as usize;
             msg!("{} {}", job_index, state.jobs.len());
@@ -698,12 +671,13 @@ mod tests {
         // bad job index since no jobs
         let validator = Pubkey::new_unique();
         let mut validator_account = Account::new(10, 0, &validator);
+        add_whitelist_validator(validator, &creator, &mut pool_account).unwrap();
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
         let validator_account_info: AccountInfo = (&creator, true, &mut validator_account).into();
         let accounts = vec![pool_account_info, validator_account_info];
         assert_matches!(
             process_instruction(&id(), &accounts, &packed),
-            Err(ProgramError::Custom(6))
+            Err(ProgramError::Custom(3))
         );
 
         // add a job
@@ -739,8 +713,9 @@ mod tests {
             assert_eq!(pool_state.jobs[0].attestations.len(), 1);
             assert_eq!(pool_state.jobs[0].attestations[0].0, new_validator);
             assert_eq!(pool_state.jobs[0].attestations[0].1, Hash::default());
-            assert_eq!(pool_state.validator_whitelist.len(), 1);
-            assert_eq!(pool_state.validator_whitelist[0], new_validator);
+            assert_eq!(pool_state.validator_whitelist.len(), 2);
+            assert_eq!(pool_state.validator_whitelist[0], validator);
+            assert_eq!(pool_state.validator_whitelist[1], new_validator);
         }
     }
 }
