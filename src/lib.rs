@@ -381,12 +381,18 @@ pub fn process_instruction(
             state.pack(&mut new_pool_data)?;
         }
         MLPoolInstruction::RemovePoolMember { key: key_to_remove } => {
-            // TODO: check that super-user is a signer
             let account_info_iter = &mut accounts.iter();
             let pool = next_account_info(account_info_iter)?;
+            let creator = next_account_info(account_info_iter)?;
+            if !creator.is_signer {
+                Err(MLPoolError::InvalidPoolCreator)?;
+            }
             let mut pool_data = pool.data.borrow_mut();
             msg!("unpacking..");
             let mut state = MLJobPoolState::unpack(&mut pool_data)?;
+            if *creator.key != state.creator {
+                Err(MLPoolError::InvalidPoolCreator)?;
+            }
             msg!("done unpacking..");
             let mut to_remove = None;
             for (i, key) in state.validator_whitelist.iter().enumerate() {
@@ -563,9 +569,11 @@ mod tests {
         let packed = instruction.pack();
 
         let pool_account_info: AccountInfo = (creator, true, pool_account).into();
+        let mut creator_account = Account::new(1, 0, creator);
+        let creator_account_info: AccountInfo = (creator, true, &mut creator_account).into();
 
         // add another
-        let accounts = vec![pool_account_info];
+        let accounts = vec![pool_account_info, creator_account_info];
         process_instruction(&id(), &accounts, &packed)?;
 
         Ok(new_validator)
