@@ -359,10 +359,17 @@ pub fn process_instruction(
         MLPoolInstruction::AddPoolMember { key: new_key } => {
             // TODO: check that super-user is a signer
             let account_info_iter = &mut accounts.iter();
-            let new_pool = next_account_info(account_info_iter)?;
-            let mut new_pool_data = new_pool.data.borrow_mut();
+            let pool = next_account_info(account_info_iter)?;
+            let creator = next_account_info(account_info_iter)?;
+            if !creator.is_signer {
+                Err(MLPoolError::InvalidPoolCreator)?;
+            }
+            let mut new_pool_data = pool.data.borrow_mut();
             msg!("unpacking..");
             let mut state = MLJobPoolState::unpack(&mut new_pool_data)?;
+            if *creator.key != state.creator {
+                Err(MLPoolError::InvalidPoolCreator)?;
+            }
             msg!("done unpacking..");
             for key in &state.validator_whitelist {
                 if *key == new_key {
@@ -504,9 +511,12 @@ mod tests {
         let instruction = MLPoolInstruction::AddPoolMember { key: new_validator };
         let packed = instruction.pack();
 
-        let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
+        let pool_key = Pubkey::new_unique();
+        let pool_account_info: AccountInfo = (&pool_key, true, &mut pool_account).into();
+        let mut creator_account = Account::new(1, 0, &creator);
+        let creator_account_info: AccountInfo = (&creator, true, &mut creator_account).into();
 
-        let accounts = vec![pool_account_info];
+        let accounts = vec![pool_account_info, creator_account_info];
         process_instruction(&id(), &accounts, &packed).unwrap();
         {
             let pool_state = MLJobPoolState::unpack(&pool_account.data()).unwrap();
@@ -516,7 +526,8 @@ mod tests {
         }
 
         let pool_account_info: AccountInfo = (&creator, true, &mut pool_account).into();
-        let accounts = vec![pool_account_info];
+        let creator_account_info: AccountInfo = (&creator, true, &mut creator_account).into();
+        let accounts = vec![pool_account_info, creator_account_info];
         // Add another
         assert_matches!(
             process_instruction(&id(), &accounts, &packed),
@@ -533,9 +544,11 @@ mod tests {
         let packed = instruction.pack();
 
         let pool_account_info: AccountInfo = (creator, true, pool_account).into();
+        let mut creator_account = Account::new(1, 0, creator);
+        let creator_account_info: AccountInfo = (creator, true, &mut creator_account).into();
 
         // add another
-        let accounts = vec![pool_account_info];
+        let accounts = vec![pool_account_info, creator_account_info];
         process_instruction(&id(), &accounts, &packed)?;
 
         Ok(new_validator)
